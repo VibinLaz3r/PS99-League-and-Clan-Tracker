@@ -3,9 +3,7 @@ const API_BASE = 'https://ps99.biggamesapi.io';
 const LEAGUE_API_URL = `${API_BASE}/v1/leagues`;
 const CLAN_API_URL = `${API_BASE}/v1/clans`;
 const POLL_INTERVAL = 45;
-const VERSION = '1.03';
 const PAGE_SIZE = 25;
-const CLAN_PAGE_SIZE = 500;
 const MAX_TOTAL = 200000;
 const SCAN_LIMIT = 10;
 
@@ -19,8 +17,6 @@ let notificationTimer = null;
 let pollTimer = null;
 let pollStart = Date.now();
 let wakeResolve = null;
-let popupWindow = null;
-let notFoundNotified = new Set();
 
 // local key-value storage
 let rankCache = {};
@@ -36,11 +32,10 @@ function lsGet(key, def) {
   } catch { return def; }
 }
 function lsSet(key, val) {
-  try { localStorage.setItem(key, JSON.stringify(val)); } catch(e) { console.warn('lsSet failed', key, e); }
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
 }
 
-function flushSettings() {
-  console.log('SAVING clan:', trackedNames.clan, 'league:', trackedNames.league, 'mode:', currentMode);
+function saveSettings() {
   lsSet('tracked_names_clan', trackedNames.clan);
   lsSet('tracked_names_league', trackedNames.league);
   lsSet('api_mode', currentMode);
@@ -50,10 +45,8 @@ function flushSettings() {
   lsSet('first_run', firstRun);
 }
 function loadSettings() {
-  console.log('LOADING...');
   trackedNames.clan = lsGet('tracked_names_clan', ['POPS']);
   trackedNames.league = lsGet('tracked_names_league', []);
-  console.log('LOADED clan:', trackedNames.clan, 'league:', trackedNames.league, 'mode:', localStorage.getItem('api_mode'));
   currentMode = lsGet('api_mode', 'clan');
   autoSwitchInterval = lsGet('auto_switch', 0);
   notifyOvertake = lsGet('notify_overtake', true);
@@ -117,16 +110,6 @@ function getPointHistory(key, minutes) {
   return (pointHistory[key] || []).filter(e => e.t >= cutoff).sort((a, b) => a.t - b.t);
 }
 
-// ===== NAME RESOLVERS =====
-const _nameCache = {};
-function resolveMemberName(uid, displayName) {
-  if (displayName && displayName !== String(uid) && displayName !== '') return displayName;
-  if (_nameCache[uid]) return _nameCache[uid];
-}
-async function resolveMemberNames(members) {
-  // Roblox API blocks CORS from browsers, skipped
-}
-
 // ===== API CLIENT =====
 async function fetchWithRetry(url, params, retries) {
   if (retries === undefined) retries = 3;
@@ -153,7 +136,7 @@ async function fetchWithRetry(url, params, retries) {
 }
 
 async function fetchLegacyClansPage(page, pageSize) {
-  if (pageSize === undefined) pageSize = CLAN_PAGE_SIZE;
+  if (pageSize === undefined) pageSize = 100;
   const data = await fetchWithRetry(`${API_BASE}/api/clans`, { page, pageSize, sort: 'Points', sortOrder: 'desc' });
   return data ? data.data || [] : [];
 }
@@ -230,37 +213,19 @@ async function bsFind(name, pts, fetchPageFn, pageSize) {
     else { hi = mid - 1; }
   }
   let sp = Math.floor((lo - 1) / pageSize) + 1;
-  const scan = async (fromPg, toPg, step) => {
-    for (let p = fromPg; step > 0 ? p <= toPg : p >= toPg; p += step) {
-      const lgs = await fetchPageFn(p);
-      for (let i = 0; i < (lgs || []).length; i++) {
-        if ((lgs[i].Name || '').toLowerCase() === name.toLowerCase()) {
-          return { rank: (p - 1) * pageSize + i + 1, pageData: lgs };
-        }
+  for (let p = sp; p >= Math.max(1, sp - SCAN_LIMIT); p--) {
+    const lgs = await fetchPageFn(p);
+    for (let i = 0; i < lgs.length; i++) {
+      if ((lgs[i].Name || '').toLowerCase() === name.toLowerCase()) {
+        return { rank: (p - 1) * pageSize + i + 1, pageData: lgs };
       }
-      if (!lgs || lgs.length === 0) break;
     }
-    return null;
-  };
-  let res = await scan(sp, Math.max(1, sp - SCAN_LIMIT), -1);
-  if (res) return res;
-  res = await scan(sp + 1, sp + SCAN_LIMIT, 1);
-  if (res) return res;
-  // Backward scan from end (for low-point clans missed by binary search)
-  const maxPg = Math.ceil(MAX_TOTAL / pageSize);
-  const totalBatches = Math.ceil(maxPg / 10);
-  for (let batch = 0; batch < totalBatches; batch++) {
-    const endPg = maxPg - batch * 10;
-    const startPg = Math.max(1, endPg - 9);
-    const tasks = [];
-    for (let pg = startPg; pg <= endPg; pg++) tasks.push(fetchPageFn(pg).then(d => ({ page: pg, data: d })));
-    const results = await Promise.all(tasks);
-    for (const { page: pg, data: lgs } of results) {
-      if (!lgs || lgs.length === 0) return { rank: null, pageData: null };
-      for (let i = 0; i < lgs.length; i++) {
-        if ((lgs[i].Name || '').toLowerCase() === name.toLowerCase()) {
-          return { rank: (pg - 1) * pageSize + i + 1, pageData: lgs };
-        }
+  }
+  for (let p = sp + 1; p <= sp + SCAN_LIMIT; p++) {
+    const lgs = await fetchPageFn(p);
+    for (let i = 0; i < lgs.length; i++) {
+      if ((lgs[i].Name || '').toLowerCase() === name.toLowerCase()) {
+        return { rank: (p - 1) * pageSize + i + 1, pageData: lgs };
       }
     }
   }
@@ -333,18 +298,18 @@ async function fetchMembersAsync(name, mode) {
         }
       }
       const memberUids = new Set((detail.Members || []).map(m => Number(m.UserID)).filter(n => n > 0));
-      const ptsMap = {};
-      for (const c of bestContribs) {
-        if (c && typeof c === 'object') {
-          const uid = Number(c.UserID) || 0;
-          if (uid && memberUids.has(uid)) ptsMap[uid] = (ptsMap[uid] || 0) + (c.Points || 0);
+      if (bestContribs.length > 0) {
+        const ptsMap = {};
+        for (const c of bestContribs) {
+          if (c && typeof c === 'object') {
+            const uid = Number(c.UserID) || 0;
+            if (uid && memberUids.has(uid)) ptsMap[uid] = c.Points || 0;
+          }
         }
-      }
-      for (const m of (detail.Members || [])) {
-        const uid = Number(m.UserID) || 0;
-        if (uid && !(uid in ptsMap)) ptsMap[uid] = 0;
-      }
-      if (Object.keys(ptsMap).length > 0) {
+        for (const m of (detail.Members || [])) {
+          const uid = Number(m.UserID) || 0;
+          if (uid && !(uid in ptsMap)) ptsMap[uid] = 0;
+        }
         for (const [uidStr, pts] of Object.entries(ptsMap)) {
           const uid = parseInt(uidStr);
           result.push({ display_name: String(uid), user_id: uid, points: pts });
@@ -456,16 +421,17 @@ async function buildEntityPayload(name, mode, rank, points, iconUrl, allEntries,
     }
   }
 
+  // Raw icon URL — browser loads from Roblox CDN directly
   const iconDataUrl = iconUrl || '';
 
-  const rawMembers = await fetchMembersAsync(name, mode);
   const members = [];
+  const rawMembers = await fetchMembersAsync(name, mode);
+  await resolveMemberNames(rawMembers);
   for (const m of rawMembers) {
     const mkey = `member:${m.user_id}`;
     savePointSnapshot(mkey, m.display_name, m.points);
     const mrate = getPointRate(mkey);
-    const midle = getIdleSeconds(mkey);
-    members.push({ display_name: m.display_name, user_id: m.user_id, points: m.points, rate: mrate, idle: midle });
+    members.push({ display_name: m.display_name, user_id: m.user_id, points: m.points, rate: mrate });
   }
 
   const aboveEnts = entries.filter(e => e.type === 'above');
@@ -488,53 +454,34 @@ async function buildEntityBs(name, mode) {
   const cached = getRankCache(name);
   const detail = mode === 'league' ? await fetchLeagueDetail(name) : await fetchLegacyClanDetail(name);
   if (!detail || !detail.Name) return { name, error: 'Not found' };
+  const pts = detail.Points || 0;
   const iconUrl = detail.Icon || '';
   const pageSize = mode === 'league' ? PAGE_SIZE : 100;
   const fetchFn = mode === 'league'
     ? fetchLeaderboardPage
-    : (pg) => fetchLegacyClansPage(pg, CLAN_PAGE_SIZE);
+    : (pg) => fetchLegacyClansPage(pg, 100);
 
-  let pts = cached ? cached.points : 0;
-  if (!cached) {
-    const firstPage = await fetchFn(1);
-    if (firstPage && firstPage.length > 0) pts = Math.floor((firstPage[0].Points || 0) / 2);
-  }
-
-  if (cached) {
+  if (cached && Math.abs(cached.points - pts) < Math.max(pageSize, 10000)) {
     const rank = cached.rank;
     const pgNum = Math.floor((rank - 1) / pageSize) + 1;
     const pageData = await fetchFn(pgNum);
     if (pageData && pageData.length > 0) {
-      const selfEntry = pageData.find(e => (e.Name || '').toLowerCase() === name.toLowerCase());
-      if (selfEntry) {
-        const actualPts = selfEntry.Points || 0;
-        setRankCache(name, rank, actualPts);
-        const neighbors = await neighborsFromPage(rank, pageData, pageSize, fetchFn);
-        const aboveRaw = neighbors.filter(n => n.rank < rank);
-        const belowRaw = neighbors.filter(n => n.rank > rank);
-        return await buildEntityPayload(name, mode, rank, actualPts, iconUrl, undefined, aboveRaw, belowRaw);
-      }
+      const neighbors = await neighborsFromPage(rank, pageData, pageSize, fetchFn);
+      const aboveRaw = neighbors.filter(n => n.rank < rank);
+      const belowRaw = neighbors.filter(n => n.rank > rank);
+      return await buildEntityPayload(name, mode, rank, pts, iconUrl, undefined, aboveRaw, belowRaw);
     }
   }
 
   const bf = await bsFind(name, pts, fetchFn, pageSize);
   if (bf.rank && bf.pageData) {
-    const foundEntry = bf.pageData.find(e => (e.Name || '').toLowerCase() === name.toLowerCase());
-    const actualPts = foundEntry ? (foundEntry.Points || 0) : 0;
-    setRankCache(name, bf.rank, actualPts);
+    setRankCache(name, bf.rank, pts);
     const neighbors = await neighborsFromPage(bf.rank, bf.pageData, pageSize, fetchFn);
     const aboveRaw = neighbors.filter(n => n.rank < bf.rank);
     const belowRaw = neighbors.filter(n => n.rank > bf.rank);
-    return await buildEntityPayload(name, mode, bf.rank, actualPts, iconUrl, undefined, aboveRaw, belowRaw);
+    return await buildEntityPayload(name, mode, bf.rank, pts, iconUrl, undefined, aboveRaw, belowRaw);
   }
-
-  if (!notFoundNotified.has(name)) {
-    notFoundNotified.add(name);
-    showNotification(name + ' not found (no points or inactive) — removed from tracking', 'overtaken');
-    trackedNames[currentMode] = (trackedNames[currentMode] || []).filter(n => n.toUpperCase() !== name.toUpperCase());
-    flushSettings();
-  }
-  return await buildEntityPayload(name, mode, 99999, 0, iconUrl);
+  return await buildEntityPayload(name, mode, 99999, pts, iconUrl);
 }
 
 // ===== POLL LOOP =====
@@ -559,7 +506,7 @@ async function pollLoop() {
           // Fetch top 10 pages
           const tasks = [];
           for (let pg = 1; pg <= 10; pg++) {
-            tasks.push(fetchLegacyClansPage(pg, CLAN_PAGE_SIZE));
+            tasks.push(fetchLegacyClansPage(pg, 100));
           }
           const pagesData = await Promise.all(tasks);
           let allClans = [];
@@ -667,7 +614,7 @@ async function saveSettings(names, mode, autoSwitch, notify, skip) {
   notifyOvertake = notify !== undefined ? notify : true;
   skippedNames = skip || [];
   if (wipe) clearRankCache();
-  flushSettings();
+  saveSettings();
   activeTab = 0;
   wakePoll();
 }
@@ -681,8 +628,6 @@ function dismissFirstRun(dontShow) {
 let firstRun = true;
 
 function updateData(data) {
-  const overlay = document.getElementById('loading-overlay');
-  if (overlay) overlay.style.display = 'none';
   if (data.mode) currentMode = data.mode;
 
   if (data.last_checked) {
@@ -694,13 +639,9 @@ function updateData(data) {
     badge.className = 'status-badge error';
     badge.innerHTML = '<span class="status-dot">●</span> ' + data.error;
     document.getElementById('entities-container').className = '';
-    document.getElementById('stats-bar').className = '';
-    document.getElementById('timer-row').className = '';
   } else if (data.entities) {
     badge.className = 'status-badge live';
     badge.innerHTML = '<span class="status-dot">●</span> Live';
-    document.getElementById('stats-bar').className = 'show';
-    document.getElementById('timer-row').className = 'show';
   }
 
   if (data.entities) {
@@ -708,7 +649,6 @@ function updateData(data) {
     window._skippedNames = data.skipped_names || [];
     renderTabBar();
     renderActiveEntity();
-    sendPopupData();
 
     if (data.notification) {
       const n = data.notification;
@@ -718,7 +658,16 @@ function updateData(data) {
         showNotification(n.name + ' dropped to #' + n.new_rank + ' (was #' + n.old_rank + ')', 'overtaken');
       }
     }
-    if (document.getElementById('graph-modal').className === 'modal-overlay show') redrawGraph();
+    if (document.getElementById('graph-modal').className === 'modal-overlay show') {
+      const canvas = document.getElementById('graph-canvas');
+      const datasets = [];
+      for (const ent of entitiesData) {
+        if (ent && ent.name) {
+          datasets.push({ name: ent.name, history: ent.point_history || [], current: ent.points });
+        }
+      }
+      if (datasets.length > 0) drawSparkline(canvas, datasets);
+    }
   }
 
   pollStart = Date.now();
@@ -771,7 +720,6 @@ function renderActiveEntity() {
     document.getElementById('title').textContent = (ent.name || '').toUpperCase() + '  (' + (currentMode === 'clan' ? 'CLANS' : 'LEAGUES') + ')';
     document.getElementById('total-pts').textContent = '0';
     document.getElementById('eta').textContent = '';
-    document.getElementById('current-rank').textContent = '--';
     document.getElementById('strip-container').className = '';
     document.getElementById('card-list').innerHTML = '<div style="text-align:center;color:#f87171;padding:30px 0;">' + ent.error + '</div>';
     return;
@@ -779,12 +727,17 @@ function renderActiveEntity() {
 
   const modeLabel = currentMode === 'clan' ? 'Clans' : 'Leagues';
   document.getElementById('title').textContent = ent.name + '  (' + modeLabel + ')';
-  document.title = ent.name + ' (' + modeLabel.toUpperCase() + ') - League & Clan Tracker';
   document.getElementById('total-pts').textContent = Number(ent.points).toLocaleString();
   document.getElementById('eta').textContent = ent.eta || '';
-  document.getElementById('current-rank').textContent = ent.rank >= 99999 ? '?' : '#' + ent.rank;
 
-  document.getElementById('icon').className = ''; document.getElementById('icon').src = '';
+  const iconEl = document.getElementById('icon');
+  if (ent.icon) {
+    iconEl.src = ent.icon;
+    iconEl.className = 'show';
+  } else {
+    iconEl.className = '';
+    iconEl.src = '';
+  }
 
   window._neighborsData = ent.neighbors || [];
 
@@ -827,104 +780,31 @@ function renderActiveEntity() {
   const list = document.getElementById('card-list');
   list.innerHTML = '';
   const members = ent.members || [];
-  if (members.length === 0) {
-    list.innerHTML = '<div style="text-align:center;color:#6a6690;padding:30px 0;">No members found.</div>';
-    return;
-  }
-  for (let i = 0; i < members.length; i++) {
-    const m = members[i];
-    const card = document.createElement('div');
-    card.className = 'member-card';
-    card.innerHTML = `
-      <div class="member-rank-num">${i + 1}</div>
-      <div class="member-info">
-        <div class="member-name">${esc(m.display_name || String(m.user_id))}</div>
-        <div class="member-uid">${m.user_id}</div>
-      </div>
-      <div class="member-right">
-        <div class="member-pts">${Number(m.points).toLocaleString()}</div>
-        <div class="member-rate${m.rate > 0 ? ' green' : ' dim'}">${m.rate > 0 ? fmtRate(m.rate) : (m.idle !== null && m.idle !== undefined ? fmtIdle(m.idle) : 'idle')}</div>
-      </div>`;
-    list.appendChild(card);
+  for (const m of members) {
+    const row = document.createElement('div');
+    row.className = 'member-row';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'member-name';
+    nameEl.textContent = m.display_name;
+    row.appendChild(nameEl);
+    const ptsEl = document.createElement('div');
+    ptsEl.className = 'member-pts';
+    ptsEl.textContent = Number(m.points).toLocaleString();
+    row.appendChild(ptsEl);
+    if (m.rate > 0) {
+      const rateEl = document.createElement('div');
+      rateEl.className = 'member-rate';
+      rateEl.textContent = fmtRate(m.rate);
+      rateEl.style.color = '#4ade80';
+      row.appendChild(rateEl);
+    }
+    list.appendChild(row);
   }
 
   // Countdown bar
   const elapsed = (Date.now() - pollStart) / 1000;
   const pct = Math.min(100, (elapsed / POLL_INTERVAL) * 100);
   document.getElementById('countdown-bar').style.width = pct + '%';
-}
-
-function updatePopupUI() {
-  if (!popupWindow || popupWindow.closed) { popupWindow = null; return; }
-  try { if (popupWindow.document.readyState !== 'complete' && popupWindow.document.readyState !== 'interactive') return; } catch(e) { popupWindow = null; return; }
-  const doc = popupWindow.document;
-  const ent = entitiesData[activeTab];
-  if (!ent || ent.error) return;
-  doc.getElementById('nm').textContent = ent.name || '--';
-  doc.getElementById('rk').textContent = ent.rank >= 99999 ? '?' : '#' + ent.rank;
-  doc.getElementById('pt').textContent = Number(ent.points).toLocaleString();
-  const c = doc.getElementById('nb');
-  c.innerHTML = '';
-  const neighbors = ent.neighbors || [];
-  const aboveArr = neighbors.filter(n => n.type === 'above');
-  const self = neighbors.find(n => n.type === 'self');
-  const belowArr = neighbors.filter(n => n.type === 'below');
-  const items = [];
-  if (aboveArr.length > 0) { const n = aboveArr[aboveArr.length - 1]; items.push({ n, label: '+' + popupFmt(Math.abs(n.gap || 0)), cls: '' }); }
-  if (self) items.push({ n: self, label: self.rate > 0 ? '+' + popupFmt(self.rate) + '/h' : (self.idle ? 'idle ' + self.idle : 'idle'), cls: ' s' });
-  if (belowArr.length > 0) { const n = belowArr[0]; items.push({ n, label: '-' + popupFmt(Math.abs(n.gap || 0)), cls: '' }); }
-  if (items.length > 0) {
-    for (const item of items) {
-      const el = doc.createElement('div');
-      el.className = 'nr' + item.cls;
-      el.innerHTML = '<div class="r">' + (item.n.rank >= 99999 ? '?' : '#' + item.n.rank) + '</div>'
-        + '<div class="l">' + popupEsc(item.n.name) + '</div>'
-        + '<div class="v">' + Number(item.n.points).toLocaleString() + '</div>'
-        + '<div class="s">' + item.label + '</div>';
-      c.appendChild(el);
-    }
-  } else {
-    c.innerHTML = '<div class="e">No data</div>';
-  }
-  const remaining = Math.max(0, Math.ceil(POLL_INTERVAL - (Date.now() - pollStart) / 1000));
-  doc.getElementById('st').textContent = remaining + 's | ' + new Date().toLocaleTimeString();
-}
-function popupFmt(v) { if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M'; if (v >= 1000) return (v / 1000).toFixed(1) + 'k'; return Math.round(v).toLocaleString(); }
-function popupEsc(s) { const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
-
-function togglePopup() {
-  if (popupWindow && !popupWindow.closed) { popupWindow.close(); popupWindow = null; return; }
-  popupWindow = window.open('', 'TrackerPopup',
-    'width=500,height=400,menubar=no,toolbar=no,location=no,status=no,resizable=yes');
-  popupWindow.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><style>'
-    + '*{margin:0;padding:0;box-sizing:border-box}'
-    + ':root{--bg:#0c0a1a;--text:#e2e0f0;--text2:#c8c4e8;--text3:#a09cc0;--text4:#6a6690;--accent:#7c5cff;--green:#4ade80;--yellow:#facc15;--border:#2d2960;--bg3:#14112a}'
-    + 'body{font-family:Inter,Segoe UI,sans-serif;background:var(--bg);color:var(--text);overflow:hidden;user-select:none}'
-    + '#app{display:flex;flex-direction:column;height:100vh;padding:12px 16px;gap:10px}'
-    + '#hdr{display:flex;align-items:baseline;gap:12px;padding-bottom:10px;border-bottom:1px solid var(--border)}'
-    + '#nm{font-size:16px;font-weight:700;text-transform:uppercase;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
-    + '#rk{font-size:28px;font-weight:700;color:var(--text2)}'
-    + '#pt{font-size:24px;font-weight:700;color:var(--yellow)}'
-    + '#nb{display:flex;flex-direction:column;gap:6px;flex:1;min-height:0}'
-    + '.nr{display:flex;align-items:center;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:6px 12px;gap:10px;flex-shrink:0}'
-    + '.nr.s{border-color:var(--accent);background:rgba(124,92,255,0.08)}'
-    + '.nr .r{font-size:14px;font-weight:700;color:var(--text4);min-width:36px}'
-    + '.nr .l{font-size:13px;font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-transform:uppercase}'
-    + '.nr .v{font-size:15px;font-weight:700}'
-    + '.nr .s{font-size:11px;font-weight:600;color:var(--text4);min-width:60px;text-align:right}'
-    + '.e{flex:1;display:flex;align-items:center;justify-content:center;color:var(--text4);font-size:13px}'
-    + '#st{text-align:center;font-size:10px;color:var(--text4);padding-top:8px;border-top:1px solid var(--border)}'
-    + '</style></head><body><div id="app">'
-    + '<div id="hdr"><div id="nm">--</div><div id="rk">--</div><div id="pt">--</div></div>'
-    + '<div id="nb"><div class="e">Waiting for data...</div></div>'
-    + '<div id="st">Connected</div>'
-    + '</div></body></html>');
-  popupWindow.document.close();
-  setTimeout(() => updatePopupUI(), 300);
-}
-
-function sendPopupData() {
-  updatePopupUI();
 }
 
 function showNotification(msg, type) {
@@ -1090,7 +970,7 @@ async function getCardData(cardName, cardMode) {
   try {
     if (cardMode === 'clan') {
       const tasks = [];
-      for (let pg = 1; pg <= 10; pg++) tasks.push(fetchLegacyClansPage(pg, CLAN_PAGE_SIZE));
+      for (let pg = 1; pg <= 10; pg++) tasks.push(fetchLegacyClansPage(pg, 100));
       const pagesData = await Promise.all(tasks);
       let allClans = [];
       for (const pd of pagesData) {
@@ -1105,22 +985,22 @@ async function getCardData(cardName, cardMode) {
       if (!entry) {
         const detail = await fetchLegacyClanDetail(cardName);
         if (!detail || !detail.Name) return result;
-        const bf = await bsFind(cardName, 0, (pg) => fetchLegacyClansPage(pg, CLAN_PAGE_SIZE), CLAN_PAGE_SIZE);
+        const pts = detail.Points || 0;
+        const bf = await bsFind(cardName, pts, (pg) => fetchLegacyClansPage(pg, 100), 100);
         if (bf.rank && bf.pageData) {
-          const selfEntry = bf.pageData.find(e => (e.Name || '').toLowerCase() === cardName.toLowerCase());
-          const actualPts = selfEntry ? (selfEntry.Points || 0) : 0;
-          const ns = await neighborsFromPage(bf.rank, bf.pageData, CLAN_PAGE_SIZE, (pg) => fetchLegacyClansPage(pg, CLAN_PAGE_SIZE));
+          const ns = await neighborsFromPage(bf.rank, bf.pageData, 100, (pg) => fetchLegacyClansPage(pg, 100));
           for (const n of ns) {
             const typ = n.name.toLowerCase() === cardName.toLowerCase() ? 'self' : n.rank < bf.rank ? 'above' : 'below';
-            const gap = typ === 'self' ? 0 : Math.abs(n.points - actualPts);
+            const gap = typ === 'self' ? 0 : Math.abs(n.points - pts);
             entries.push({ rank: n.rank, name: n.name, points: n.points, type: typ, gap, uid: n.uid });
           }
-          if (entries.length === 0) entries.push({ rank: 0, name: cardName, points: actualPts, type: 'self', gap: 0, uid: 0 });
+          if (entries.length === 0) entries.push({ rank: 0, name: cardName, points: pts, type: 'self', gap: 0, uid: 0 });
         } else {
-          entries.push({ rank: 0, name: cardName, points: 0, type: 'self', gap: 0, uid: 0 });
+          entries.push({ rank: 0, name: cardName, points: pts, type: 'self', gap: 0, uid: 0 });
         }
         result.neighbors = entries;
         const raw = await fetchMembersAsync(cardName, cardMode);
+        await resolveMemberNames(raw);
         for (const r of raw) result.members.push(r);
         return result;
       }
@@ -1137,23 +1017,23 @@ async function getCardData(cardName, cardMode) {
     } else {
       const detail = await fetchLeagueDetail(cardName);
       if (!detail || !detail.Name) return result;
-      const bf = await bsFind(cardName, 0, fetchLeaderboardPage, PAGE_SIZE);
+      const pts = detail.Points || 0;
+      const bf = await bsFind(cardName, pts, fetchLeaderboardPage, PAGE_SIZE);
       if (bf.rank && bf.pageData) {
-        const selfEntry = bf.pageData.find(e => (e.Name || '').toLowerCase() === cardName.toLowerCase());
-        const actualPts = selfEntry ? (selfEntry.Points || 0) : 0;
         const ns = await neighborsFromPage(bf.rank, bf.pageData, PAGE_SIZE, fetchLeaderboardPage);
         for (const n of ns) {
           const typ = n.name.toLowerCase() === cardName.toLowerCase() ? 'self' : n.rank < bf.rank ? 'above' : 'below';
-          const gap = typ === 'self' ? 0 : (typ === 'above' ? n.points - actualPts : actualPts - n.points);
+          const gap = typ === 'self' ? 0 : (typ === 'above' ? n.points - pts : pts - n.points);
           entries.push({ rank: n.rank, name: n.name, points: n.points, type: typ, gap, uid: n.uid });
         }
-        if (entries.length === 0) entries.push({ rank: 0, name: cardName, points: actualPts, type: 'self', gap: 0, uid: 0 });
+        if (entries.length === 0) entries.push({ rank: 0, name: cardName, points: pts, type: 'self', gap: 0, uid: 0 });
       } else {
-        entries.push({ rank: 0, name: cardName, points: 0, type: 'self', gap: 0, uid: 0 });
+        entries.push({ rank: 0, name: cardName, points: pts, type: 'self', gap: 0, uid: 0 });
       }
     }
     result.neighbors = entries;
     const raw = await fetchMembersAsync(cardName, cardMode);
+    await resolveMemberNames(raw);
     for (const r of raw) result.members.push(r);
   } catch (e) {
     console.error('getCardData error:', e);
@@ -1211,21 +1091,30 @@ async function searchClan(query, mode) {
   const results = [];
 
   if (mode === 'clan') {
-    for (let page = 1; page <= 20; page++) {
-      const pageData = await fetchLegacyClansPage(page, CLAN_PAGE_SIZE);
-      if (!pageData || pageData.length === 0) break;
-      for (let i = 0; i < pageData.length; i++) {
-        const c = pageData[i];
-        if ((c.Name || '').toLowerCase().includes(q)) {
-          results.push({ rank: (page - 1) * 100 + i + 1, name: c.Name || '', points: c.Points || 0 });
+    const allClans = await fetchLegacyClansPage(1, 100);
+    if (allClans) {
+      allClans.sort((a, b) => (b.Points || 0) - (a.Points || 0));
+      for (let i = 0; i < allClans.length; i++) {
+        if ((allClans[i].Name || '').toLowerCase().includes(q)) {
+          results.push({ rank: i + 1, name: allClans[i].Name || '', points: allClans[i].Points || 0 });
         }
       }
+      if (results.length > 0) return { mode, entries: results.slice(0, 50) };
     }
-    if (results.length > 0) { results.sort((a, b) => b.points - a.points); return { mode, entries: results.slice(0, 50) }; }
+    for (let page = 1; page <= 20; page++) {
+      const pageData = await fetchLegacyClansPage(page, 100);
+      if (!pageData || pageData.length === 0) break;
+      for (const c of pageData) {
+        if ((c.Name || '').toLowerCase().includes(q)) {
+          results.push({ rank: 0, name: c.Name || '', points: c.Points || 0 });
+        }
+      }
+      if (results.length > 0) return { mode, entries: results.slice(0, 50) };
+    }
     return { mode, entries: [] };
   } else {
     const seenNames = new Set();
-    for (let page = 1; page <= 60; page++) {
+    for (let page = 1; page <= 20; page++) {
       const pageData = await fetchLeaderboardPage(page);
       if (!Array.isArray(pageData) || pageData.length === 0) break;
       for (let i = 0; i < pageData.length; i++) {
@@ -1236,8 +1125,21 @@ async function searchClan(query, mode) {
           results.push({ rank: (page - 1) * 25 + i + 1, name, points: pageData[i].Points || 0 });
         }
       }
+      if (results.length > 0) return { mode, entries: results.slice(0, 50) };
     }
-    if (results.length > 0) { results.sort((a, b) => b.points - a.points); return { mode, entries: results.slice(0, 50) }; }
+    for (let page = 21; page <= 60; page++) {
+      const pageData = await fetchLeaderboardPage(page);
+      if (!Array.isArray(pageData) || pageData.length === 0) break;
+      for (let i = 0; i < pageData.length; i++) {
+        const name = pageData[i].Name || '';
+        if (seenNames.has(name.toLowerCase())) continue;
+        seenNames.add(name.toLowerCase());
+        if (name.toLowerCase().includes(q)) {
+          results.push({ rank: (page - 1) * 25 + i + 1, name, points: pageData[i].Points || 0 });
+        }
+      }
+      if (results.length > 0) return { mode, entries: results.slice(0, 50) };
+    }
     const detail = await fetchLeagueDetail(query.trim());
     if (detail && detail.Name) return { mode, entries: [{ rank: 0, name: detail.Name, points: detail.Points || 0 }] };
     return { mode, entries: [] };
@@ -1260,7 +1162,7 @@ async function fetchTop100() {
   try {
     let results = [];
     if (currentMode === 'clan') {
-      const allClans = await fetchLegacyClansPage(1, CLAN_PAGE_SIZE);
+      const allClans = await fetchLegacyClansPage(1, 100);
       if (allClans) {
         allClans.sort((a, b) => (b.Points || 0) - (a.Points || 0));
         results = allClans.slice(0, 100).map((c, i) => ({ rank: i + 1, name: c.Name || '', points: c.Points || 0 }));
@@ -1298,22 +1200,16 @@ function openGraph() {
   const ent = entitiesData[activeTab];
   title.textContent = ent && ent.name ? ent.name + ' - Points (60 min)' : 'Points';
   modal.className = 'modal-overlay show';
-  setTimeout(() => redrawGraph(), 100);
-}
-function redrawGraph() {
-  const canvas = document.getElementById('graph-canvas');
-  const info = document.getElementById('graph-info');
-  const datasets = [];
-  let totalEntries = 0;
-  for (const e of entitiesData) {
-    if (e && e.name) {
-      const h = e.point_history || [];
-      totalEntries += h.length;
-      datasets.push({ name: e.name, history: h, current: e.points });
+  setTimeout(() => {
+    const canvas = document.getElementById('graph-canvas');
+    const datasets = [];
+    for (const e of entitiesData) {
+      if (e && e.name) {
+        datasets.push({ name: e.name, history: e.point_history || [], current: e.points });
+      }
     }
-  }
-  info.textContent = totalEntries + ' entries | 60 min';
-  if (datasets.length > 0) drawSparkline(canvas, datasets);
+    if (datasets.length > 0) drawSparkline(canvas, datasets);
+  }, 100);
 }
 function closeGraph() {
   document.getElementById('graph-modal').className = 'modal-overlay';
@@ -1330,7 +1226,7 @@ function drawSparkline(canvas, datasets) {
   ctx.clearRect(0, 0, w, h);
 
   const colors = ['#4ade80', '#7c5cff', '#f59e0b', '#ef4444', '#3b82f6', '#ec4899'];
-  const pad = { top: 15, bottom: 20, left: 50, right: 10 };
+  const pad = { top: 15, bottom: 20, left: 10, right: 10 };
   const gw = w - pad.left - pad.right;
   const gh = h - pad.top - pad.bottom;
 
@@ -1348,7 +1244,7 @@ function drawSparkline(canvas, datasets) {
     if (ds.current > allMax) allMax = ds.current;
   }
 
-  if (!isFinite(allMin) || !isFinite(allMax)) {
+  if (!isFinite(allMin) || !isFinite(allMax) || allMin === allMax) {
     ctx.fillStyle = '#6a6690';
     ctx.font = '12px sans-serif';
     ctx.textAlign = 'center';
@@ -1356,7 +1252,7 @@ function drawSparkline(canvas, datasets) {
     return;
   }
 
-  if (allMax === allMin) allMax = allMin + (allMin === 0 ? 1 : allMin * 0.1);
+  if (allMax === allMin) allMax = allMin + 1;
 
   const range = allMax - allMin;
   const yScale = gh / range;
@@ -1405,14 +1301,14 @@ function drawSparkline(canvas, datasets) {
     const pts = ds.history;
     if (pts.length === 0) continue;
     const sorted = pts.slice().sort((a, b) => a.t - b.t);
-    const last = sorted[sorted.length - 1];
-    const tMin = sorted[0].t, tMax = last.t;
+    const tMin = sorted[0].t, tMax = sorted[sorted.length - 1].t;
     const tRange = tMax - tMin || 1;
-    const x = pad.left + ((last.t - tMin) / tRange) * gw;
+    const x = pad.left + ((Date.now() / 1000 - tMin) / tRange) * gw;
+    const xClamped = Math.min(x, w - pad.right);
     const y = pad.top + gh - (ds.current - allMin) * yScale;
     ctx.fillStyle = colors[di % colors.length];
     ctx.beginPath();
-    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.arc(Math.min(xClamped, w - pad.right - 5), y, 4, 0, Math.PI * 2);
     ctx.fill();
   }
 }
@@ -1439,11 +1335,6 @@ function openSettings() {
   autoSwitchInput.value = autoSwitchInterval;
   notifyCheck.checked = notifyOvertake;
 
-  // Check localStorage availability
-  const warn = document.getElementById('settings-storage-warning');
-  try { localStorage.setItem('__test', '1'); localStorage.removeItem('__test'); warn.style.display = 'none'; } catch(e) { warn.style.display = 'block'; }
-
-  renderDataUsage();
   modal.className = 'modal-overlay show';
   document.getElementById('settings-feedback').textContent = '';
 }
@@ -1530,49 +1421,6 @@ function saveSettingsUI() {
   feedback.style.color = '#4ade80';
 }
 
-function renderDataUsage() {
-  let total = 0;
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
-    const v = localStorage.getItem(k);
-    total += (k ? k.length : 0) + (v ? v.length : 0);
-  }
-  const pts = Object.keys(pointHistory).length;
-  const cached = Object.keys(rankCache).length;
-  const size = total < 1024 ? total + 'B' : (total / 1024).toFixed(1) + 'KB';
-  document.getElementById('settings-version').textContent = 'v' + VERSION;
-  document.getElementById('settings-data-info').childNodes[1].textContent = '  |  ' + size + '  |  ' + pts + ' point entries  |  ' + cached + ' cached ranks';
-}
-
-function resetPointHistory() {
-  if (!confirm('Clear all point history data?')) return;
-  pointHistory = {};
-  savePointHistory();
-  renderDataUsage();
-  document.getElementById('settings-feedback').textContent = 'Point history cleared.';
-  document.getElementById('settings-feedback').style.color = '#4ade80';
-}
-
-function resetRankCache() {
-  if (!confirm('Clear all cached ranks?')) return;
-  clearRankCache();
-  saveRankCache();
-  renderDataUsage();
-  document.getElementById('settings-feedback').textContent = 'Rank cache cleared.';
-  document.getElementById('settings-feedback').style.color = '#4ade80';
-}
-
-function resetAllData() {
-  if (!confirm('Clear ALL saved data (settings, cache, history)? This cannot be undone.')) return;
-  localStorage.clear();
-  pointHistory = {};
-  rankCache = {};
-  renderDataUsage();
-  document.getElementById('settings-feedback').textContent = 'All data cleared. Reloading...';
-  document.getElementById('settings-feedback').style.color = '#facc15';
-  setTimeout(() => location.reload(), 1500);
-}
-
 function closeSettings() {
   document.getElementById('settings-modal').className = 'modal-overlay';
 }
@@ -1590,26 +1438,11 @@ function showWelcome() {
   }
 }
 
-function renderLoadingCache() {
-  const el = document.getElementById('loading-cache');
-  if (!el) return;
-  const names = trackedNames[currentMode] || [];
-  if (names.length === 0) { el.textContent = ''; return; }
-  const lines = names.map(n => {
-    const c = getRankCache(n);
-    if (c) return '<div class="cache-row">' + esc(n.toUpperCase()) + ' &mdash; #' + c.rank + ' &middot; ' + c.points.toLocaleString() + ' pts</div>';
-    return '<div class="cache-row dim">' + esc(n.toUpperCase()) + ' &mdash; no data yet</div>';
-  });
-  el.innerHTML = lines.join('');
-}
-
 // ===== INIT =====
 document.addEventListener('DOMContentLoaded', () => {
-  console.log('v' + VERSION);
   loadSettings();
   loadRankCache();
   loadPointHistory();
-  renderLoadingCache();
   startAutoSwitch();
 
   // Welcome
@@ -1618,26 +1451,17 @@ document.addEventListener('DOMContentLoaded', () => {
   // Start poll loop
   pollLoop();
 
-  // Countdown bar and timer update
+  // Countdown bar update
   setInterval(() => {
     const elapsed = (Date.now() - pollStart) / 1000;
-    const remaining = Math.max(0, Math.ceil(POLL_INTERVAL - elapsed));
     const pct = Math.min(100, (elapsed / POLL_INTERVAL) * 100);
     document.getElementById('countdown-bar').style.width = pct + '%';
-    const nextCheck = document.getElementById('next-check');
-    if (nextCheck) nextCheck.textContent = remaining + 's';
   }, 1000);
-
-  // Popup timer refresh
-  setInterval(() => { if (popupWindow && !popupWindow.closed) updatePopupUI(); }, 3000);
 
   // Event listeners
   document.getElementById('settings-btn').addEventListener('click', openSettings);
   document.getElementById('settings-close').addEventListener('click', closeSettings);
   document.getElementById('settings-save').addEventListener('click', saveSettingsUI);
-  document.getElementById('settings-reset-points').addEventListener('click', resetPointHistory);
-  document.getElementById('settings-reset-cache').addEventListener('click', resetRankCache);
-  document.getElementById('settings-reset-all').addEventListener('click', resetAllData);
 
   document.getElementById('neighbors-btn').addEventListener('click', openNeighbors);
   document.getElementById('neighbors-close').addEventListener('click', closeNeighbors);
@@ -1651,7 +1475,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.getElementById('graph-btn').addEventListener('click', openGraph);
   document.getElementById('graph-close').addEventListener('click', closeGraph);
-  document.getElementById('popout-btn').addEventListener('click', togglePopup);
 
   document.getElementById('check-btn').addEventListener('click', wakePoll);
 
@@ -1670,19 +1493,33 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Resize handler for graph canvas
   window.addEventListener('resize', () => {
-    if (document.getElementById('graph-canvas') && document.getElementById('graph-modal').className === 'modal-overlay show') redrawGraph();
+    const canvas = document.getElementById('graph-canvas');
+    if (canvas && document.getElementById('graph-modal').className === 'modal-overlay show') {
+      const datasets = [];
+      for (const ent of entitiesData) {
+        if (ent && ent.name) {
+          datasets.push({ name: ent.name, history: ent.point_history || [], current: ent.points });
+        }
+      }
+      if (datasets.length > 0) drawSparkline(canvas, datasets);
+    }
   });
 
   // Hotkeys
   document.addEventListener('keydown', (e) => {
-    // J / K for cycling tabs (K = next, J = prev)
-    if ((e.key === 'k' || e.key === 'K') && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      const tag = e.target && e.target.tagName ? e.target.tagName : '';
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA') { e.preventDefault(); if (entitiesData.length > 1) switchTab((activeTab + 1) % entitiesData.length); }
-    }
-    if ((e.key === 'j' || e.key === 'J') && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      const tag = e.target && e.target.tagName ? e.target.tagName : '';
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA') { e.preventDefault(); if (entitiesData.length > 1) switchTab((activeTab - 1 + entitiesData.length) % entitiesData.length); }
+    // Ctrl+Tab / Ctrl+Shift+Tab
+    if (e.ctrlKey && e.key === 'Tab') {
+      e.preventDefault();
+      if (entitiesData.length <= 1) return;
+      const dir = e.shiftKey ? -1 : 1;
+      let next = (activeTab + dir + entitiesData.length) % entitiesData.length;
+      // Skip errored entities
+      let attempts = 0;
+      while (entitiesData[next] && entitiesData[next].error && attempts < entitiesData.length) {
+        next = (next + dir + entitiesData.length) % entitiesData.length;
+        attempts++;
+      }
+      switchTab(next);
     }
     // S / N for neighbors
     if (e.key === 's' || e.key === 'S' || e.key === 'n' || e.key === 'N') {

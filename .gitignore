@@ -1,11 +1,2 @@
-config.json
-rank_cache.json
-point_history.json
-active_tab.txt
-__pycache__/
-*.pyc
-.venv/
-
-.ui-backup/
-
-.ui-backup2/
+website/
+static/

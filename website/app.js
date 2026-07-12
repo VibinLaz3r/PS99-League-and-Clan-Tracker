@@ -1540,8 +1540,8 @@ function renderDataUsage() {
   const pts = Object.keys(pointHistory).length;
   const cached = Object.keys(rankCache).length;
   const size = total < 1024 ? total + 'B' : (total / 1024).toFixed(1) + 'KB';
-  document.getElementById('settings-data-info').textContent = 'v' + VERSION + '  |  ' + size + '  |  ' + pts + ' point entries  |  ' + cached + ' cached ranks';
   document.getElementById('settings-version').textContent = 'v' + VERSION;
+  document.getElementById('settings-data-info').childNodes[1].textContent = '  |  ' + size + '  |  ' + pts + ' point entries  |  ' + cached + ' cached ranks';
 }
 
 function resetPointHistory() {
