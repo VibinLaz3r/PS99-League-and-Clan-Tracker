@@ -1,2 +1,6 @@
 website/
 static/
+.ui-backup/
+.ui-backup2/
+__pycache__/
+*.pyc
