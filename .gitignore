@@ -5,3 +5,7 @@ active_tab.txt
 __pycache__/
 *.pyc
 .venv/
+
+.ui-backup/
+
+.ui-backup2/

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>Tracker Popup</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #0c0a1a; --text: #e2e0f0; --text2: #c8c4e8; --text3: #a09cc0; --text4: #6a6690;
+  --accent: #7c5cff; --accent2: #58c8d6; --green: #4ade80; --yellow: #facc15; --red: #f87171;
+  --border: #2d2960; --bg3: #14112a; --bg4: #1e1a3a; --bg5: #2a2650;
+}
+body {
+  font-family: 'Inter','Segoe UI',-apple-system,sans-serif;
+  background: var(--bg); color: var(--text); overflow: hidden;
+  user-select: none; -webkit-user-select: none; zoom: 1.125;
+}
+#popup-app {
+  display: flex; flex-direction: column; height: 100vh;
+  padding: 10px 14px; gap: 8px;
+}
+#popup-header {
+  display: flex; align-items: center; gap: 12px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+#popup-title {
+  font-size: 14px; font-weight: 700; text-transform: uppercase;
+  flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#popup-rank { font-size: 26px; font-weight: 700; color: var(--text2); flex-shrink: 0; }
+#popup-points { font-size: 20px; font-weight: 700; color: var(--yellow); flex-shrink: 0; }
+#popup-neighbors {
+  display: flex; gap: 4px; flex: 1; min-height: 0;
+}
+.popup-neighbor {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 8px; padding: 4px 6px;
+  min-width: 0;
+}
+.popup-neighbor.self { border-color: var(--accent); background: rgba(124,92,255,0.08); }
+.popup-neighbor .n-rank { font-size: 11px; font-weight: 700; color: var(--text4); }
+.popup-neighbor .n-name { font-size: 9px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; text-transform: uppercase; }
+.popup-neighbor .n-pts { font-size: 12px; font-weight: 700; }
+.popup-neighbor .n-sub { font-size: 8px; color: var(--text4); }
+.popup-empty {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  color: var(--text4); font-size: 11px;
+}
+#popup-status {
+  text-align: center; font-size: 9px; color: var(--text4);
+  padding-top: 6px; border-top: 1px solid var(--border);
+}
+</style>
+</head>
+<body>
+<div id="popup-app">
+  <div id="popup-header">
+    <div id="popup-title">--</div>
+    <div id="popup-rank">--</div>
+    <div id="popup-points">--</div>
+  </div>
+  <div id="popup-neighbors"><div class="popup-empty">Waiting for data...</div></div>
+  <div id="popup-status">Connected</div>
+</div>
+<script>
+window.addEventListener('message', (e) => {
+  if (!e.data || e.data.type !== 'tracker-update') return;
+  const d = e.data;
+  document.getElementById('popup-title').textContent = d.name || '--';
+  document.getElementById('popup-rank').textContent = d.rank >= 99999 ? '?' : '#' + d.rank;
+  document.getElementById('popup-points').textContent = Number(d.points).toLocaleString();
+  const container = document.getElementById('popup-neighbors');
+  container.innerHTML = '';
+  if (d.neighbors && d.neighbors.length > 0) {
+    for (const n of d.neighbors) {
+      const el = document.createElement('div');
+      el.className = 'popup-neighbor' + (n.type === 'self' ? ' self' : '');
+      let subText = '';
+      if (n.type === 'self') {
+        subText = n.rate > 0 ? '+' + fmt(n.rate) + '/h' : (n.idle ? 'idle ' + n.idle : 'idle');
+      } else {
+        subText = (n.type === 'above' ? '+' : '-') + fmt(Math.abs(n.gap || 0));
+      }
+      el.innerHTML = '<div class="n-rank">' + (n.rank >= 99999 ? '?' : '#' + n.rank) + '</div>'
+        + '<div class="n-name">' + esc(n.name) + '</div>'
+        + '<div class="n-pts">' + Number(n.points).toLocaleString() + '</div>'
+        + '<div class="n-sub">' + subText + '</div>';
+      container.appendChild(el);
+    }
+  } else {
+    container.innerHTML = '<div class="popup-empty">No neighbors</div>';
+  }
+  document.getElementById('popup-status').textContent = 'Last update: ' + new Date().toLocaleTimeString();
+});
+function fmt(v) { if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M'; if (v >= 1000) return (v / 1000).toFixed(1) + 'k'; return Math.round(v).toLocaleString(); }
+function esc(s) { const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
+window.opener.postMessage({ type: 'tracker-popup-ready' }, '*');
+</script>
+</body>
+</html>
